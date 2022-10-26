@@ -479,6 +479,19 @@ static int krping_accept(struct krping_cb *cb)
 
 static void krping_setup_wr(struct krping_cb *cb)
 {
+	/* mr, buf, wr 정리
+	   recv_buf - recv_wr : RDMA read 를 위해 사용하는 buf, wr (temp한 공간)
+	   send_buf - send_wr : RDMA write를 위해 사용하는 buf, wr (temp한 공간)
+
+	   reg_mr - reg_mr_wr/invalidate_wr : RDMA connect를 위한 mr, wr
+	   										매 루프마다 reg_mr_wr를 통해 rkey를 업데이트 한 후 server에게 전달한다.
+											invalidate는 reg_mr_wr과 연결되어 있음
+
+	   start_buf: ping data가 있는 buf
+	   				서버는 이 버퍼를 RDMA read 한다
+	   rdma_buf : ping data를 write 하는 buf
+	   				서버는 이 버퍼에 RMDA write 한다
+	 */
 	cb->recv_sgl.addr = cb->recv_dma_addr;
 	cb->recv_sgl.length = sizeof cb->recv_buf;
 	cb->recv_sgl.lkey = cb->pd->local_dma_lkey;
@@ -709,6 +722,7 @@ static u32 krping_rdma_rkey(struct krping_cb *cb, u64 buf, int post_inv)
 	int ret;
 	struct scatterlist sg = {0};
 
+	// invalid date wr???
 	cb->invalidate_wr.ex.invalidate_rkey = cb->reg_mr->rkey;
 
 	/*
@@ -724,6 +738,7 @@ static u32 krping_rdma_rkey(struct krping_cb *cb, u64 buf, int post_inv)
 		cb->reg_mr_wr.access = IB_ACCESS_REMOTE_READ;
 	else
 		cb->reg_mr_wr.access = IB_ACCESS_REMOTE_WRITE | IB_ACCESS_LOCAL_WRITE;
+
 	sg_dma_address(&sg) = buf;
 	sg_dma_len(&sg) = cb->size;
 
@@ -760,6 +775,8 @@ static void krping_format_send(struct krping_cb *cb, u64 buf)
 	 * advertising the rdma buffer.  Server side
 	 * sends have no data.
 	 */
+
+	 // client만 수행, send buf를 start_buf로 지정
 	if (!cb->server || cb->wlat || cb->rlat || cb->bw) {
 		rkey = krping_rdma_rkey(cb, buf, !cb->server_invalidate);
 		info->buf = htonll(buf);
@@ -785,7 +802,7 @@ static void krping_test_server(struct krping_cb *cb)
 			break;
 		}
 
-		DEBUG_LOG("server received sink adv\n");
+		DEBUG_LOG("server received source adv\n");
 
 		cb->rdma_sq_wr.rkey = cb->remote_rkey;
 		cb->rdma_sq_wr.remote_addr = cb->remote_addr;
@@ -1483,6 +1500,7 @@ static void krping_test_client(struct krping_cb *cb)
 		cb->state = RDMA_READ_ADV;
 
 		/* Put some ascii text in the buffer. */
+		// ping data 넣기
 		cc = sprintf(cb->start_buf, "rdma-ping-%d: ", ping);
 		for (i = cc, c = start; i < cb->size; i++) {
 			cb->start_buf[i] = c;
@@ -1495,11 +1513,37 @@ static void krping_test_client(struct krping_cb *cb)
 			start = 65;
 		cb->start_buf[cb->size - 1] = 0;
 
+		/*
+		 * client만 수행
+		 * send_buf를 설정하는 과정
+		 * server가 가져갈 ping data가 있는 buf(start_buf)에 대한 metadata를 구성
+
+		 * buf는 매개변수로 전달되는 buf (start_buf)
+
+		 * key는 reg_mr_wr을 이용하여 설정
+		 * 매 루프마다 rdma connection을 업데이트 하여 사용하는데, 이에 reg_mr이 사용됨
+		 * reg_mr_wr는 server에 key에 대한 정보를 전달하기 위한 수단으로 reg_mr과 연결되어 있음
+
+		 * reg_mr의 키를 업데이트 (단순히 +1을 해서 하는 것 같음)
+		 * reg_mr_wr의 access 필드 설정 (접근권한, start_buf => read, rdma_buf => write)
+		 * 세그먼트 생성 및 buf(start_buf), size 설정
+		 * reg_mr와 세그먼트를 매핑하여 reg_mr_wr를 통해 RDMA connection info를 server에게 전달
+
+		 * size는 지정된 사이즈
+
+		 * 결국 이 함수는 send_buf metadata를 sq_wr에 저장하는 함수이다.
+		 * 그 과정에서 RDMA 연결을 재설정 함 (rkey에 관한 함수)
+		 * 재설정 되는 연결 때문에 rkey를 다시 server에게 전달 (ib_post_send가 있는 이유)
+		 */
 		krping_format_send(cb, cb->start_dma_addr);
 		if (cb->state == ERROR) {
 			printk(KERN_ERR PFX "krping_format_send failed\n");
 			break;
 		}
+		/*
+		 * 결국 이 함수는 start_buf에 대한 metadata를 전달하는 것
+		 */
+
 		ret = ib_post_send(cb->qp, &cb->sq_wr, &bad_wr);
 		if (ret) {
 			printk(KERN_ERR PFX "post send error %d\n", ret);
